@@ -1,0 +1,163 @@
+#!/bin/bash
+
+check_command() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+if ! check_command "aws-iam-authenticator"; then
+    echo "aws-iam-authenticator is not installed."
+fi
+
+if ! check_command "aws"; then
+    echo "aws-cli is not installed."
+fi
+
+if ! check_command "kubectl"; then
+    echo "kubectl is not installed."
+fi
+
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -d|--delete-kubeconfig)
+            DELETE_KUBECONFIG=true
+            ;;
+        -r|--region)
+            if [[ -n "$2" ]]; then
+                REGION="$2"
+                shift
+            else
+                echo "Error: Missing value for flag -r/--region."
+                exit 1
+            fi
+            ;;
+        -p|--profile)
+            if [[ -n "$2" ]]; then
+                PROFILE="$2"
+                shift
+            else
+                PROFILE="NOT_SET"
+                shift
+        fi
+        ;;
+        -c|--cluster)
+            if [[ -n "$2" ]]; then
+                CLUSTER="$2"
+                shift
+            else
+                echo "Error: Missing value for flag -c/--cluster."
+                exit 1
+            fi
+            ;;
+        -u|--user-bastion)
+            if [[ -n "$2" ]]; then
+                BASTION_USER="$2"
+                shift
+            else
+                echo "Error: Missing value for flag -u/--user-bastion."
+                exit 1
+            fi
+            ;;
+        -i|--instance-id)
+            if [[ -n "$2" ]]; then
+                BASTION_INSTANCE_ID="$2"
+                shift
+            else
+                BASTION_INSTANCE_ID="NOT_SET"
+                shift
+            fi
+            ;;
+        -k|--key-path)
+            if [[ -n "$2" ]]; then
+                PUBKEY_PATH="$2"
+                shift
+            else
+                echo "Error: Missing value for flag -k/--key-path."
+                exit 1
+            fi
+            ;;
+        *)
+        echo "Unknown parameter: $1"
+        exit 1
+        ;;
+    esac
+    shift
+done
+
+PUBKEY_PATH="$HOME/.ssh/id_rsa"
+KUBE_CONFIG="${HOME}/.kube/config"
+TMP_CONFIG="${HOME}/.kube/config.tmp"
+
+if [[ $DELETE_KUBECONFIG == true ]]; then
+    echo "Removing old kubeconfig file..."
+    rm -f "${HOME}"/.kube/config 2>&1 > /dev/null
+fi
+
+echo "Updating kubeconfig file..."
+if [[ $PROFILE == "NOT_SET" ]]; then
+    aws eks update-kubeconfig --region ${REGION} --name ${CLUSTER} 2>&1 > /dev/null
+else
+    aws eks update-kubeconfig --region ${REGION} --profile ${PROFILE} --name ${CLUSTER} 2>&1 > /dev/null
+fi
+
+echo "Adding tunneling ports to kubeconfig file..."
+LAST_MATCHED_LINE=""
+while IFS= read -r LINE; do
+    if [[ $LINE == *server:* ]]; then
+        LAST_MATCHED_LINE="${LINE}"
+    fi
+done < "$KUBE_CONFIG"
+
+if [[ -n $LAST_MATCHED_LINE ]]; then
+    URL="${LAST_MATCHED_LINE#server: }"
+    PORT=$((RANDOM % (1900 - 1500 + 1) + 1500))
+
+    while IFS= read -r LINE; do
+        if [[ $LINE == "$LAST_MATCHED_LINE" ]]; then
+            echo "${URL}:${PORT}" >> "$TMP_CONFIG"
+            URL="${LINE#*//}"
+            URL="${URL%%/*}"
+        else
+            echo "${LINE}" >> "$TMP_CONFIG"
+        fi
+    done < "$KUBE_CONFIG" > "$TMP_CONFIG"
+fi
+mv "$TMP_CONFIG" "$KUBE_CONFIG" && rm -f "$TMP_CONFIG"
+
+if grep -q "${URL}" "/etc/hosts"; then
+    echo "Cluster endpoint already exists inside the hosts file..."
+else
+    echo "127.0.0.1 ${URL}" >> /etc/hosts
+fi
+
+INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:eic,Values=bastion-eic" --query "Reservations[*].Instances[*].InstanceId" --output text --region ${REGION} --profile ${PROFILE})
+
+echo "Digging cluster control plane IP..."
+if [[ $PROFILE == "NOT_SET" ]]; then
+    CLUSTER_CONTROL_PLANE_IP=$(ssh "${BASTION_USER}"@"${INSTANCE_ID}" \
+    -o "StrictHostKeyChecking no" -o ProxyCommand="aws ec2-instance-connect open-tunnel --instance-id %h --region ${REGION}" \
+    dig +short "${URL}" | awk '{ print ; exit }')
+else
+    CLUSTER_CONTROL_PLANE_IP=$(ssh "${BASTION_USER}"@"${INSTANCE_ID}" \
+    -o "StrictHostKeyChecking no" -o ProxyCommand="aws ec2-instance-connect open-tunnel --instance-id %h --region ${REGION} --profile ${PROFILE}" \
+    dig +short "${URL}" | awk '{ print ; exit }')
+fi
+
+echo "Setting up SSH tunnels through EIC..."
+RANDOM_STRING=$(openssl rand -base64 12 | tr -dc 'a-zA-Z' | head -c8)
+if [[ $PROFILE == "NOT_SET" ]]; then
+    ssh -fNT -S /tmp/control_socket_${RANDOM_STRING} -M "${BASTION_USER}"@"${INSTANCE_ID}" -L "${PORT}":"${CLUSTER_CONTROL_PLANE_IP}":443 \
+    -o "Compression yes" \
+    -o "TCPKeepAlive yes" \
+    -o "Ciphers aes128-gcm@openssh.com" \
+    -o "ControlPath ~/.ssh/master-%C" \
+    -o "StrictHostKeyChecking no" -o ProxyCommand="aws ec2-instance-connect open-tunnel --instance-id %h --region ${REGION}"
+else
+    ssh -fNT -S /tmp/control_socket_${RANDOM_STRING} -M "${BASTION_USER}"@"${INSTANCE_ID}" -L "${PORT}":"${CLUSTER_CONTROL_PLANE_IP}":443 \
+    -o "Compression yes" \
+    -o "TCPKeepAlive yes" \
+    -o "Ciphers aes128-gcm@openssh.com" \
+    -o "ControlPath ~/.ssh/master-%C" \
+    -o "StrictHostKeyChecking no" -o ProxyCommand="aws ec2-instance-connect open-tunnel --instance-id %h --region ${REGION} --profile ${PROFILE}"
+fi
+
+echo "Done!"
